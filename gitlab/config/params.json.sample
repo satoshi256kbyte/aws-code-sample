@@ -1,0 +1,13 @@
+{
+    "vpcId": "vpc-xxxxxxxx",
+    "subnetId": "subnet-xxxxxxxx",
+    "securityGroupId": "sg-xxxxxxxx",
+    "cognitoClientId": "xxxxxxxxxxxxxxx",
+    "cognitoClientSecret": "xxxxxxxxxxxxxxx",
+    "cognitoDomain": "your-cognito-domain",
+    "cognitoRegion": "ap-northeast-1",
+    "instanceType": "t3.large",
+    "amiId": "",
+    "region": "ap-northeast-1",
+    "account": ""
+}
