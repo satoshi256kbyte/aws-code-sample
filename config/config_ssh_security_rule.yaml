@@ -1,0 +1,258 @@
+Description: CloudFormation template to enable AWS Config and set up SSH security group monitoring with auto-remediation
+
+Parameters:
+  Email:
+    Description: Notification email address for the SNS topic
+    Type: String
+
+Resources:
+  ConfigBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub "example-${AWS::AccountId}-${AWS::Region}-${AWS::StackName}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  ConfigServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: example-config-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWS_ConfigRole
+      Policies:
+        - PolicyName: example-config-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub "arn:aws:s3:::${ConfigBucket}/*"
+                Condition:
+                  StringLike:
+                    s3:x-amz-acl: bucket-owner-full-control
+
+  ConfigRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Properties:
+      Name: default
+      RecordingGroup:
+        AllSupported: true
+        IncludeGlobalResourceTypes: true
+      RoleARN: !GetAtt ConfigServiceRole.Arn
+
+  ConfigDeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    Properties:
+      ConfigSnapshotDeliveryProperties:
+        DeliveryFrequency: Six_Hours
+      S3BucketName: !Ref ConfigBucket
+      Name: default
+
+  RemediationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: example-remediation-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: example-remediation-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:RevokeSecurityGroupIngress
+                  - ec2:DescribeSecurityGroups
+                Resource: '*'
+
+  SSHSecurityGroupRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: example-ssh-security-group-rule
+      Description: Checks if security groups that are in use disallow unrestricted incoming SSH traffic
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::SecurityGroup
+      Source:
+        Owner: AWS
+        SourceIdentifier: INCOMING_SSH_DISABLED
+      MaximumExecutionFrequency: TwentyFour_Hours
+
+  SSHRemediationConfig:
+    Type: AWS::Config::RemediationConfiguration
+    Properties:
+      ConfigRuleName: !Ref SSHSecurityGroupRule
+      TargetId: AWS-DisablePublicAccessForSecurityGroup
+      TargetType: SSM_DOCUMENT
+      Automatic: true
+      Parameters:
+        AutomationAssumeRole:
+          StaticValue:
+            Values:
+              - !GetAtt RemediationRole.Arn
+        GroupId:
+          ResourceValue:
+            Value: RESOURCE_ID
+      MaximumAutomaticAttempts: 1
+      RetryAttemptSeconds: 30
+
+  ComplianceNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: example-sns-security-compliance-topic
+      Tags:
+        - Key: Name
+          Value: example-sns-security-compliance-topic
+
+  ComplianceTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref ComplianceNotificationTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: __default_statement_ID
+            Effect: Allow
+            Principal:
+              AWS: '*'
+            Action:
+              - SNS:GetTopicAttributes
+              - SNS:SetTopicAttributes
+              - SNS:AddPermission
+              - SNS:RemovePermission
+              - SNS:DeleteTopic
+              - SNS:Subscribe
+              - SNS:ListSubscriptionsByTopic
+              - SNS:Publish
+            Resource: !Ref ComplianceNotificationTopic
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/example-ssh-compliance-rule
+          - Sid: AllowPublishFromEventBridge
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref ComplianceNotificationTopic
+
+  ComplianceEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref ComplianceNotificationTopic
+      Protocol: email
+      Endpoint: !Ref Email
+
+  NonComplianceRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: example-ssh-non-compliance-rule
+      Description: Detects when resources become non-compliant with SSH security group rule
+      EventPattern:
+        source:
+          - aws.config
+        detail-type:
+          - Config Rules Compliance Change
+        detail:
+          configRuleName:
+            - !Ref SSHSecurityGroupRule
+          newEvaluationResult:
+            complianceType:
+              - NON_COMPLIANT
+      State: ENABLED
+      Targets:
+        - Id: example-ssh-non-compliance-notification
+          Arn: !Ref ComplianceNotificationTopic
+          InputTransformer:
+            InputPathsMap:
+              resourceId: $.detail.resourceId
+              account: $.account
+              region: $.region
+              time: $.time
+              resourceType: $.detail.resourceType
+            InputTemplate: |-
+              "SSH Security Group Compliance Violation Detected"
+
+              "Resource Type: <resourceType>"
+              "Resource ID: <resourceId>"
+              "Event Time: <time>"
+              "Account Number: <account>"
+              "Region: <region>"
+              
+              "A security group has been detected with SSH port (22) open to the public. Automatic remediation has been initiated."
+
+  ReturnToComplianceRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: example-ssh-return-to-compliance-rule
+      Description: Detects when resources return to compliance with SSH security group rule
+      EventPattern:
+        source:
+          - aws.config
+        detail-type:
+          - Config Rules Compliance Change
+        detail:
+          configRuleName:
+            - !Ref SSHSecurityGroupRule
+          newEvaluationResult:
+            complianceType:
+              - COMPLIANT
+          oldEvaluationResult:
+            complianceType:
+              - NON_COMPLIANT
+      State: ENABLED
+      Targets:
+        - Id: example-ssh-return-to-compliance-notification
+          Arn: !Ref ComplianceNotificationTopic
+          InputTransformer:
+            InputPathsMap:
+              resourceId: $.detail.resourceId
+              account: $.account
+              region: $.region
+              time: $.time
+              resourceType: $.detail.resourceType
+            InputTemplate: |-
+              "SSH Security Group Compliance Restored"
+
+              "Resource Type: <resourceType>"
+              "Resource ID: <resourceId>"
+              "Event Time: <time>"
+              "Account Number: <account>"
+              "Region: <region>"
+              
+              "A security group has been successfully remediated and no longer has SSH port (22) open to the public."
+
+Outputs:
+  ConfigBucketName:
+    Description: The name of the S3 bucket used by AWS Config to store configuration history
+    Value: !Ref ConfigBucket
+  ConfigRuleName:
+    Description: The name of the AWS Config Rule for SSH security groups
+    Value: !Ref SSHSecurityGroupRule
+  NotificationTopicArn:
+    Description: The ARN of the SNS topic for compliance notifications
+    Value: !Ref ComplianceNotificationTopic

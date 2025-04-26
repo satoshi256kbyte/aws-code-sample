@@ -1,0 +1,89 @@
+Description: Root user sign-in alert rule for US East (N. Virginia) region
+
+Parameters:
+  Email:
+    Description: Notification email address for the SNS topic
+    Type: String
+
+Resources:
+  RootUserSigninTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: example-sns-security-alert-topic
+      Tags:
+        - Key: Name
+          Value: example-sns-security-alert-topic
+          
+  RootUserSigninTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref RootUserSigninTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: __default_statement_ID
+            Effect: Allow
+            Principal:
+              AWS: '*'
+            Action:
+              - SNS:GetTopicAttributes
+              - SNS:SetTopicAttributes
+              - SNS:AddPermission
+              - SNS:RemovePermission
+              - SNS:DeleteTopic
+              - SNS:Subscribe
+              - SNS:ListSubscriptionsByTopic
+              - SNS:Publish
+            Resource: !Ref RootUserSigninTopic
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub ${AWS::AccountId}
+          - Sid: AllowPublishFromEventBridge
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref RootUserSigninTopic
+
+  RootUserSigninEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref RootUserSigninTopic
+      Protocol: email
+      Endpoint: !Ref Email
+
+  RootUserSigninRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: example-root-user-signin-rule
+      EventPattern:
+        source:
+          - aws.signin
+        detail-type:
+          - AWS Console Sign In via CloudTrail
+        detail:
+          eventSource:
+            - signin.amazonaws.com
+          eventName:
+            - ConsoleLogin
+          userIdentity:
+            type:
+              - Root
+      State: ENABLED
+      EventBusName: default
+      Targets:
+        - Id: example-root-user-signin
+          Arn: !Ref RootUserSigninTopic
+          InputTransformer:
+            InputPathsMap:
+              sourceIPAddress: $.detail.sourceIPAddress
+              account: $.account
+              region: $.region
+              eventTime: $.detail.eventTime
+            InputTemplate: |-
+              "Root user sign-in detected"
+
+              "Login time: <eventTime>"
+              "Account number: <account>"
+              "Source IP address: <sourceIPAddress>"

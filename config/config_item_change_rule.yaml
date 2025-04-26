@@ -1,0 +1,93 @@
+Description: AWS Config item change detection
+
+Parameters:
+  Email:
+    Description: Notification email address for the SNS topic
+    Type: String
+
+Resources:
+  ConfigItemChangeTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: example-sns-security-alert-topic
+      Tags:
+        - Key: Name
+          Value: example-sns-security-alert-topic
+          
+  ConfigItemChangeTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref ConfigItemChangeTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: __default_statement_ID
+            Effect: Allow
+            Principal:
+              AWS: '*'
+            Action:
+              - SNS:GetTopicAttributes
+              - SNS:SetTopicAttributes
+              - SNS:AddPermission
+              - SNS:RemovePermission
+              - SNS:DeleteTopic
+              - SNS:Subscribe
+              - SNS:ListSubscriptionsByTopic
+              - SNS:Publish
+            Resource: !Ref ConfigItemChangeTopic
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub ${AWS::AccountId}
+          - Sid: AllowPublishFromEventBridge
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref ConfigItemChangeTopic
+
+  ConfigItemChangeEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref ConfigItemChangeTopic
+      Protocol: email
+      Endpoint: !Ref Email
+
+  ConfigItemChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: example-config-item-change-alert-rule
+      EventPattern:
+        source:
+          - aws.config
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - config.amazonaws.com
+          eventName:
+            - anything-but:
+                - PutEvaluations
+          readOnly:
+            - false
+      State: ENABLED
+      EventBusName: default
+      Targets:
+        - Id: example-config-item-change-alert
+          Arn: !Ref ConfigItemChangeTopic
+          InputTransformer:
+            InputPathsMap:
+              account: $.account
+              eventName: $.detail.eventName
+              region: $.region
+              sourceIPAddress: $.detail.sourceIPAddress
+              eventTime: $.detail.eventTime
+            InputTemplate: |-
+              "AWS Config configuration has been changed."
+
+              "Event Name: <eventName>"
+              "Event Time: <eventTime>"
+              "Account Number: <account>"
+              "Region: <region>"
+              "Source IP Address: <sourceIPAddress>"
+
